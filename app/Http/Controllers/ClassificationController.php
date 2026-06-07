@@ -4,14 +4,30 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Models\Mahasiswa;
+use App\Services\PredictorService;
 
 class ClassificationController extends Controller
 {
+    private PredictorService $predictor;
+
+    public function __construct(PredictorService $predictor)
+    {
+        $this->predictor = $predictor;
+    }
+
     public function index()
     {
         $totalTraining = Mahasiswa::count();
+        $metrics = $this->predictor->getMetrics();
+        $models = $this->predictor->getAvailableModels();
+        $defaultModel = 'random-forest';
 
-        return view('klasifikasi', compact('totalTraining'));
+        return view('klasifikasi', compact(
+            'totalTraining',
+            'metrics',
+            'models',
+            'defaultModel',
+        ));
     }
 
     public function predict(Request $request)
@@ -20,133 +36,71 @@ class ClassificationController extends Controller
             'ipk' => 'required|numeric',
             'kehadiran' => 'required|numeric',
             'sks_lulus' => 'required|numeric',
-            'status_kerja' => 'required'
+            'status_kerja' => 'required',
+            'model' => 'sometimes|string',
         ]);
 
-        $total = Mahasiswa::count();
+        $input = [
+            (float) $request->ipk,
+            (float) $request->kehadiran,
+            (float) $request->sks_lulus,
+            $request->status_kerja === 'Ya' ? 1.0 : 0.0,
+        ];
 
-        $totalYa = Mahasiswa::where('tepat_waktu', 'Ya')->count();
-        $totalTidak = Mahasiswa::where('tepat_waktu', 'Tidak')->count();
+        $modelKey = $request->input('model', 'random-forest');
 
-        if ($total == 0) {
-            return redirect()->back()
-                ->with('error', 'Data training tidak ditemukan.');
+        try {
+            $result = $this->predictor->predict($modelKey, $input);
+        } catch (\Exception $e) {
+            return redirect('/')->with('error', $e->getMessage());
         }
 
-        $pYa = $totalYa / $total;
-        $pTidak = $totalTidak / $total;
-
-        /*
-        |--------------------------------------------------------------------------
-        | KATEGORISASI DATA TESTING
-        |--------------------------------------------------------------------------
-        */
-
-        $ipkTinggi = $request->ipk >= 3;
-        $hadirTinggi = $request->kehadiran >= 80;
-        $sksTinggi = $request->sks_lulus >= 110;
-
-        /*
-        |--------------------------------------------------------------------------
-        | PROBABILITAS IPK
-        |--------------------------------------------------------------------------
-        */
-
-        $ipkYa = Mahasiswa::where('tepat_waktu', 'Ya')
-            ->where('ipk', $ipkTinggi ? '>=' : '<', 3)
-            ->count();
-
-        $ipkTidak = Mahasiswa::where('tepat_waktu', 'Tidak')
-            ->where('ipk', $ipkTinggi ? '>=' : '<', 3)
-            ->count();
-
-        /*
-        |--------------------------------------------------------------------------
-        | PROBABILITAS KEHADIRAN
-        |--------------------------------------------------------------------------
-        */
-
-        $hadirYa = Mahasiswa::where('tepat_waktu', 'Ya')
-            ->where('kehadiran', $hadirTinggi ? '>=' : '<', 80)
-            ->count();
-
-        $hadirTidak = Mahasiswa::where('tepat_waktu', 'Tidak')
-            ->where('kehadiran', $hadirTinggi ? '>=' : '<', 80)
-            ->count();
-
-        /*
-        |--------------------------------------------------------------------------
-        | PROBABILITAS SKS
-        |--------------------------------------------------------------------------
-        */
-
-        $sksYa = Mahasiswa::where('tepat_waktu', 'Ya')
-            ->where('sks_lulus', $sksTinggi ? '>=' : '<', 110)
-            ->count();
-
-        $sksTidak = Mahasiswa::where('tepat_waktu', 'Tidak')
-            ->where('sks_lulus', $sksTinggi ? '>=' : '<', 110)
-            ->count();
-
-        /*
-        |--------------------------------------------------------------------------
-        | STATUS KERJA
-        |--------------------------------------------------------------------------
-        */
-
-        $kerjaYa = Mahasiswa::where('tepat_waktu', 'Ya')
-            ->where('status_kerja', $request->status_kerja)
-            ->count();
-
-        $kerjaTidak = Mahasiswa::where('tepat_waktu', 'Tidak')
-            ->where('status_kerja', $request->status_kerja)
-            ->count();
-
-        /*
-        |--------------------------------------------------------------------------
-        | LAPLACE SMOOTHING
-        |--------------------------------------------------------------------------
-        */
-
-        $pIpkYa = ($ipkYa + 1) / ($totalYa + 2);
-        $pIpkTidak = ($ipkTidak + 1) / ($totalTidak + 2);
-
-        $pHadirYa = ($hadirYa + 1) / ($totalYa + 2);
-        $pHadirTidak = ($hadirTidak + 1) / ($totalTidak + 2);
-
-        $pSksYa = ($sksYa + 1) / ($totalYa + 2);
-        $pSksTidak = ($sksTidak + 1) / ($totalTidak + 2);
-
-        $pKerjaYa = ($kerjaYa + 1) / ($totalYa + 2);
-        $pKerjaTidak = ($kerjaTidak + 1) / ($totalTidak + 2);
-
-        /*
-        |--------------------------------------------------------------------------
-        | NAIVE BAYES
-        |--------------------------------------------------------------------------
-        */
-
-        $probYa =
-            $pYa *
-            $pIpkYa *
-            $pHadirYa *
-            $pSksYa *
-            $pKerjaYa;
-
-        $probTidak =
-            $pTidak *
-            $pIpkTidak *
-            $pHadirTidak *
-            $pSksTidak *
-            $pKerjaTidak;
-
-        $hasil = $probYa > $probTidak
-            ? 'Ya'
-            : 'Tidak';
-
         return redirect('/')
-            ->with('prediction', $hasil)
-            ->with('prob_ya', $probYa)
-            ->with('prob_tidak', $probTidak);
+            ->with('prediction', $result['prediction'])
+            ->with('confidence', $result['confidence'])
+            ->with('selected_model', $modelKey)
+            ->with('model_label', $this->predictor->getModelLabel($modelKey))
+            ->withInput();
+    }
+
+    public function accuracy(string $model)
+    {
+        $metrics = $this->predictor->getMetrics();
+
+        if (!isset($metrics[$model])) {
+            return response()->json(['error' => 'Model not found'], 404);
+        }
+
+        $data = $metrics[$model];
+
+        return response()->json([
+            'model' => $model,
+            'label' => $this->predictor->getModelLabel($model),
+            'accuracy' => $data['accuracy'] ?? 0,
+            'precision' => $data['precision'] ?? 0,
+            'recall' => $data['recall'] ?? 0,
+            'f1_score' => $data['f1_score'] ?? 0,
+        ]);
+    }
+
+    public function retrain()
+    {
+        $metrics = $this->predictor->forceRetrain();
+
+        $result = [];
+        foreach ($metrics as $key => $data) {
+            $result[$key] = [
+                'label' => $this->predictor->getModelLabel($key),
+                'accuracy' => $data['accuracy'] ?? 0,
+                'precision' => $data['precision'] ?? 0,
+                'recall' => $data['recall'] ?? 0,
+                'f1_score' => $data['f1_score'] ?? 0,
+            ];
+        }
+
+        return response()->json([
+            'success' => true,
+            'models' => $result,
+        ]);
     }
 }
